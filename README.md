@@ -1,5 +1,4 @@
-# Spatially informed clustering, integration, and deconvolution of spatial transcriptomics with GraphST
-
+# SpatialFusion: A Unified Model for Integrating Spatial Transcriptomics to Unveil Cell-Type Distribution, Interaction, and Functional Heterogeneity in Tissue Microenvironments
 
 ![](https://github.com/w2260584531/SpatialFusion-main/blob/main/model.png)
 
