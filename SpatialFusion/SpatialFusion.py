@@ -1,221 +1,352 @@
 import torch
-import torch.nn as nn
+from .preprocess import preprocess_adj, preprocess_adj_sparse, preprocess, construct_interaction, construct_interaction_KNN, add_contrastive_label, get_feature, permutation, fix_seed,construct_graph_by_feature
+import time
+import random
+import numpy as np
+from .modelAT import Encoder, Encoder_sparse, Encoder_map, Encoder_sc
+from tqdm import tqdm
+from torch import nn
 import torch.nn.functional as F
-from torch.nn.parameter import Parameter
-from torch.nn.modules.module import Module
-
-class Discriminator(nn.Module):
-    def __init__(self, n_h):
-        super(Discriminator, self).__init__()
-        self.f_k = nn.Bilinear(n_h, n_h, 1)
-
-        for m in self.modules():
-            self.weights_init(m)
-
-    def weights_init(self, m):
-        if isinstance(m, nn.Bilinear):
-            torch.nn.init.xavier_uniform_(m.weight.data)
-            if m.bias is not None:
-                m.bias.data.fill_(0.0)
-
-    def forward(self, c, h_pl, h_mi, s_bias1=None, s_bias2=None):
-        c_x = c.expand_as(h_pl)  
-
-        sc_1 = self.f_k(h_pl, c_x)
-        sc_2 = self.f_k(h_mi, c_x)
-
-        if s_bias1 is not None:
-            sc_1 += s_bias1
-        if s_bias2 is not None:
-            sc_2 += s_bias2
-
-        logits = torch.cat((sc_1, sc_2), 1)
-
-        return logits
+from scipy.sparse.csc import csc_matrix
+from scipy.sparse.csr import csr_matrix
+import pandas as pd
     
-class AvgReadout(nn.Module):
-    def __init__(self):
-        super(AvgReadout, self).__init__()
+class SpatialFusion():
+    def __init__(self, 
+        adata,
+        adata_sc = None,
+        device= torch.device('cpu'),
+        learning_rate=0.001,
+        learning_rate_sc = 0.01,
+        weight_decay=0.00,
+        epochs=600, 
+        dim_input=3000,
+        dim_output=64,
+        random_seed = 41,
+        alpha = 10,
+        beta = 1,
+        theta = 0.1,
+        lamda1 = 10,
+        lamda2 = 1,
+        deconvolution = False,
+        datatype = '10X'
+        ):
+        '''\
 
-    def forward(self, emb, mask=None):
-        vsum = torch.mm(mask, emb)
-        row_sum = torch.sum(mask, 1)
-        row_sum = row_sum.expand((vsum.shape[1], row_sum.shape[0])).T
-        global_emb = vsum / row_sum 
+        Parameters
+        ----------
+        adata : anndata
+            AnnData object of spatial data.
+        adata_sc : anndata, optional
+            AnnData object of scRNA-seq data. adata_sc is needed for deconvolution. The default is None.
+        device : string, optional
+            Using GPU or CPU? The default is 'cpu'.
+        learning_rate : float, optional
+            Learning rate for ST representation learning. The default is 0.001.
+        learning_rate_sc : float, optional
+            Learning rate for scRNA representation learning. The default is 0.01.
+        weight_decay : float, optional
+            Weight factor to control the influence of weight parameters. The default is 0.00.
+        epochs : int, optional
+            Epoch for model training. The default is 600.
+        dim_input : int, optional
+            Dimension of input feature. The default is 3000.
+        dim_output : int, optional
+            Dimension of output representation. The default is 64.
+        random_seed : int, optional
+            Random seed to fix model initialization. The default is 41.
+        alpha : float, optional
+            Weight factor to control the influence of reconstruction loss in representation learning. 
+            The default is 10.
+        beta : float, optional
+            Weight factor to control the influence of contrastive loss in representation learning. 
+            The default is 1.
+        lamda1 : float, optional
+            Weight factor to control the influence of reconstruction loss in mapping matrix learning. 
+            The default is 10.
+        lamda2 : float, optional
+            Weight factor to control the influence of contrastive loss in mapping matrix learning. 
+            The default is 1.
+        deconvolution : bool, optional
+            Deconvolution task? The default is False.
+        datatype : string, optional    
+            Data type of input. Our model supports 10X Visium ('10X'), Stereo-seq ('Stereo'), and Slide-seq/Slide-seqV2 ('Slide') data. 
+        Returns
+        -------
+        The learned representation 'self.emb_rec'.
+
+        '''
+        self.adata = adata.copy()
+        self.device = device
+        self.learning_rate=learning_rate
+        self.learning_rate_sc = learning_rate_sc
+        self.weight_decay=weight_decay
+        self.epochs=epochs
+        self.random_seed = random_seed
+        self.alpha = alpha
+        self.beta = beta
+        self.theta = theta
+        self.lamda1 = lamda1
+        self.lamda2 = lamda2
+        self.deconvolution = deconvolution
+        self.datatype = datatype
+        
+        fix_seed(self.random_seed)
+
+        if 'adj' not in adata.obsm.keys():
+           if self.datatype in ['Stereo', 'Slide']:
+              construct_interaction_KNN(self.adata)
+           else:    
+              construct_interaction(self.adata)
+
+        if 'highly_variable' not in adata.var.keys():
+           preprocess(self.adata)
+
+        if 'label_CSL' not in adata.obsm.keys():    
+           add_contrastive_label(self.adata)
+        
+        if 'feat' not in adata.obsm.keys():
+           get_feature(self.adata)
+
+        if 'adj_feat' not in adata.obsm.keys():
+           construct_graph_by_feature(self.adata)
+
+
+        
+        self.features = torch.FloatTensor(self.adata.obsm['feat'].copy()).to(self.device)
+        self.features_a = torch.FloatTensor(self.adata.obsm['feat_a'].copy()).to(self.device)
+        self.label_CSL = torch.FloatTensor(self.adata.obsm['label_CSL']).to(self.device)
+        self.adj = self.adata.obsm['adj']
+        self.adj_feat=self.adata.obsm['adj_feat']
+        self.graph_neigh = torch.FloatTensor(self.adata.obsm['graph_neigh'].copy() + np.eye(self.adj.shape[0])).to(self.device)
+    
+        self.dim_input = self.features.shape[1]
+        self.dim_output = dim_output
+        
+        if self.datatype in ['Stereo', 'Slide']:
+           #using sparse
+           print('Building sparse matrix ...')
+           self.adj = preprocess_adj_sparse(self.adj).to(self.device)
+        else: 
+           # standard version
+           self.adj = preprocess_adj(self.adj)
+           self.adj = torch.FloatTensor(self.adj).to(self.device)
+
+        if self.datatype in ['Stereo', 'Slide']:
+           #using sparse
+           print('Building sparse matrix ...')
+           self.adj_feat = preprocess_adj_sparse(self.adj_feat).to(self.device)
+        else: 
+           # standard version
+           self.adj_feat = preprocess_adj(self.adj_feat)
+           self.adj_feat = torch.FloatTensor(self.adj_feat).to(self.device)
+        
+        if self.deconvolution:
+           self.adata_sc = adata_sc.copy() 
+            
+           if isinstance(self.adata.X, csc_matrix) or isinstance(self.adata.X, csr_matrix):
+              self.feat_sp = adata.X.toarray()[:, ]
+           else:
+              self.feat_sp = adata.X[:, ]
+           if isinstance(self.adata_sc.X, csc_matrix) or isinstance(self.adata_sc.X, csr_matrix):
+              self.feat_sc = self.adata_sc.X.toarray()[:, ]
+           else:
+              self.feat_sc = self.adata_sc.X[:, ]
+            
+           # fill nan as 0
+           self.feat_sc = pd.DataFrame(self.feat_sc).fillna(0).values
+           self.feat_sp = pd.DataFrame(self.feat_sp).fillna(0).values
           
-        return F.normalize(global_emb, p=2, dim=1) 
+           self.feat_sc = torch.FloatTensor(self.feat_sc).to(self.device)
+           self.feat_sp = torch.FloatTensor(self.feat_sp).to(self.device)
+        
+           if self.adata_sc is not None:
+              self.dim_input = self.feat_sc.shape[1] 
+
+           self.n_cell = adata_sc.n_obs
+           self.n_spot = adata.n_obs
+            
+    def train(self):
+        if self.datatype in ['Stereo', 'Slide']:
+           self.model = Encoder_sparse(self.dim_input, self.dim_output, self.graph_neigh).to(self.device)
+        else:
+           self.model = Encoder(self.dim_input, self.dim_output, self.graph_neigh).to(self.device)
+        self.loss_CSL = nn.BCEWithLogitsLoss()
     
-class Encoder(Module):
-    def __init__(self, in_features, out_features, graph_neigh, dropout=0.0, act=F.relu):
-        super(Encoder, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.graph_neigh = graph_neigh
-        self.dropout = dropout
-        self.act = act
+        self.optimizer = torch.optim.Adam(self.model.parameters(), self.learning_rate, 
+                                          weight_decay=self.weight_decay)
         
-        self.weight1 = Parameter(torch.FloatTensor(self.in_features, self.out_features))
-        self.weight2 = Parameter(torch.FloatTensor(self.out_features, self.in_features))
-        self.reset_parameters()
+        print('Begin to train ST data...')
+        self.model.train()
         
-        self.disc = Discriminator(self.out_features)
-
-        self.sigm = nn.Sigmoid()
-        self.read = AvgReadout()
+        for epoch in tqdm(range(self.epochs)): 
+            self.model.train()
+              
+            self.features_a = permutation(self.features)
+            self.hiden_feat, self.emb, ret, ret_a = self.model(self.features, self.features_a, self.adj ,self.adj_feat)
+            
+            self.loss_sl_1 = self.loss_CSL(ret, self.label_CSL)
+            self.loss_sl_2 = self.loss_CSL(ret_a, self.label_CSL)
+            self.loss_feat = F.mse_loss(self.features, self.emb)
+            
+            loss =  self.alpha*self.loss_feat + self.beta*(self.loss_sl_1 + self.loss_sl_2)
+            
+            self.optimizer.zero_grad()
+            loss.backward() 
+            self.optimizer.step()
+            
         
-    def reset_parameters(self):
-        torch.nn.init.xavier_uniform_(self.weight1)
-        torch.nn.init.xavier_uniform_(self.weight2)
-
-    def forward(self, feat, feat_a, adj):
-        z = F.dropout(feat, self.dropout, self.training)
-        z = torch.mm(z, self.weight1)
-        z = torch.mm(adj, z)
+        print("Optimization finished for ST data!")
         
-        hiden_emb = z
-        
-        h = torch.mm(z, self.weight2)
-        h = torch.mm(adj, h)
-        
-        emb = self.act(z)
-        
-        z_a = F.dropout(feat_a, self.dropout, self.training)
-        z_a = torch.mm(z_a, self.weight1)
-        z_a = torch.mm(adj, z_a)
-        emb_a = self.act(z_a)
-        
-        g = self.read(emb, self.graph_neigh) 
-        g = self.sigm(g)  
-
-        g_a = self.read(emb_a, self.graph_neigh)
-        g_a = self.sigm(g_a)  
-
-        ret = self.disc(g, emb, emb_a)  
-        ret_a = self.disc(g_a, emb_a, emb) 
-        
-        return hiden_emb, h, ret, ret_a
-    
-class Encoder_sparse(Module):
-    """
-    Sparse version of Encoder
-    """
-    def __init__(self, in_features, out_features, graph_neigh, dropout=0.0, act=F.relu):
-        super(Encoder_sparse, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.graph_neigh = graph_neigh
-        self.dropout = dropout
-        self.act = act
-        
-        self.weight1 = Parameter(torch.FloatTensor(self.in_features, self.out_features))
-        self.weight2 = Parameter(torch.FloatTensor(self.out_features, self.in_features))
-        self.reset_parameters()
-        
-        self.disc = Discriminator(self.out_features)
-
-        self.sigm = nn.Sigmoid()
-        self.read = AvgReadout()
-        
-    def reset_parameters(self):
-        torch.nn.init.xavier_uniform_(self.weight1)
-        torch.nn.init.xavier_uniform_(self.weight2)
-
-    def forward(self, feat, feat_a, adj):
-        z = F.dropout(feat, self.dropout, self.training)
-        z = torch.mm(z, self.weight1)
-        z = torch.spmm(adj, z)
-        
-        hiden_emb = z
-        
-        h = torch.mm(z, self.weight2)
-        h = torch.spmm(adj, h)
-        
-        emb = self.act(z)
-        
-        z_a = F.dropout(feat_a, self.dropout, self.training)
-        z_a = torch.mm(z_a, self.weight1)
-        z_a = torch.spmm(adj, z_a)
-        emb_a = self.act(z_a)
+        with torch.no_grad():
+             self.model.eval()
+             if self.deconvolution:
+                self.emb_rec = self.model(self.features, self.features_a, self.adj,self.adj_feat)[1]
+                
+                return self.emb_rec
+             else:  
+                if self.datatype in ['Stereo', 'Slide']:
+                   self.emb_rec = self.model(self.features, self.features_a, self.adj)[1]
+                   self.emb_rec = F.normalize(self.emb_rec, p=2, dim=1).detach().cpu().numpy() 
+                else:
+                   self.emb_rec = self.model(self.features, self.features_a, self.adj,self.adj_feat)[1].detach().cpu().numpy()
+                self.adata.obsm['emb'] = self.emb_rec
+                
+                return self.adata
          
-        g = self.read(emb, self.graph_neigh)
-        g = self.sigm(g)
+    def train_sc(self):
+        self.model_sc = Encoder_sc(self.dim_input, self.dim_output).to(self.device)
+        self.optimizer_sc = torch.optim.Adam(self.model_sc.parameters(), lr=self.learning_rate_sc)  
         
-        g_a = self.read(emb_a, self.graph_neigh)
-        g_a =self.sigm(g_a)       
-       
-        ret = self.disc(g, emb, emb_a)  
-        ret_a = self.disc(g_a, emb_a, emb)
+        print('Begin to train scRNA data...')
+        for epoch in tqdm(range(self.epochs)):
+            self.model_sc.train()
+            
+            emb = self.model_sc(self.feat_sc)
+            loss = F.mse_loss(emb, self.feat_sc)
+            
+            self.optimizer_sc.zero_grad()
+            loss.backward()
+            self.optimizer_sc.step()
+            
+        print("Optimization finished for cell representation learning!")
         
-        return hiden_emb, h, ret, ret_a     
-
-class Encoder_sc(torch.nn.Module):
-    def __init__(self, dim_input, dim_output, dropout=0.0, act=F.relu):
-        super(Encoder_sc, self).__init__()
-        self.dim_input = dim_input
-        self.dim1 = 256
-        self.dim2 = 64
-        self.dim3 = 32
-        self.act = act
-        self.dropout = dropout
+        with torch.no_grad():
+            self.model_sc.eval()
+            emb_sc = self.model_sc(self.feat_sc)
+         
+            return emb_sc
         
-        #self.linear1 = torch.nn.Linear(self.dim_input, self.dim_output)
-        #self.linear2 = torch.nn.Linear(self.dim_output, self.dim_input)
+    def train_map(self):
+        emb_sp = self.train()
+        emb_sc = self.train_sc()
         
-        #self.weight1_en = Parameter(torch.FloatTensor(self.dim_input, self.dim_output))
-        #self.weight1_de = Parameter(torch.FloatTensor(self.dim_output, self.dim_input))
+        self.adata.obsm['emb_sp'] = emb_sp.detach().cpu().numpy()
+        self.adata_sc.obsm['emb_sc'] = emb_sc.detach().cpu().numpy()
         
-        self.weight1_en = Parameter(torch.FloatTensor(self.dim_input, self.dim1))
-        self.weight2_en = Parameter(torch.FloatTensor(self.dim1, self.dim2))
-        self.weight3_en = Parameter(torch.FloatTensor(self.dim2, self.dim3))
+        # Normalize features for consistence between ST and scRNA-seq
+        emb_sp = F.normalize(emb_sp, p=2, eps=1e-12, dim=1)
+        emb_sc = F.normalize(emb_sc, p=2, eps=1e-12, dim=1)
         
-        self.weight1_de = Parameter(torch.FloatTensor(self.dim3, self.dim2))
-        self.weight2_de = Parameter(torch.FloatTensor(self.dim2, self.dim1))
-        self.weight3_de = Parameter(torch.FloatTensor(self.dim1, self.dim_input))
-      
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        torch.nn.init.xavier_uniform_(self.weight1_en)
-        torch.nn.init.xavier_uniform_(self.weight1_de)
-        
-        torch.nn.init.xavier_uniform_(self.weight2_en)
-        torch.nn.init.xavier_uniform_(self.weight2_de)
-        
-        torch.nn.init.xavier_uniform_(self.weight3_en)
-        torch.nn.init.xavier_uniform_(self.weight3_de)
-        
-    def forward(self, x):
-        x = F.dropout(x, self.dropout, self.training)
-        
-        #x = self.linear1(x)
-        #x = self.linear2(x)
-        
-        #x = torch.mm(x, self.weight1_en)
-        #x = torch.mm(x, self.weight1_de)
-        
-        x = torch.mm(x, self.weight1_en)
-        x = torch.mm(x, self.weight2_en)
-        x = torch.mm(x, self.weight3_en)
-        
-        x = torch.mm(x, self.weight1_de)
-        x = torch.mm(x, self.weight2_de)
-        x = torch.mm(x, self.weight3_de)
-        
-        return x
-    
-class Encoder_map(torch.nn.Module):
-    def __init__(self, n_cell, n_spot):
-        super(Encoder_map, self).__init__()
-        self.n_cell = n_cell
-        self.n_spot = n_spot
+        self.model_map = Encoder_map(self.n_cell, self.n_spot).to(self.device)  
           
-        self.M = Parameter(torch.FloatTensor(self.n_cell, self.n_spot))
-        self.reset_parameters()
+        self.optimizer_map = torch.optim.Adam(self.model_map.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        
+        print('Begin to learn mapping matrix...')
+        for epoch in tqdm(range(self.epochs)):
+            self.model_map.train()
+            self.map_matrix = self.model_map()
 
-    def reset_parameters(self):
-        torch.nn.init.xavier_uniform_(self.M)
+            loss_recon, loss_NCE = self.loss(emb_sp, emb_sc)
+             
+            loss = self.lamda1*loss_recon + self.lamda2*loss_NCE 
+
+            self.optimizer_map.zero_grad()
+            loss.backward()
+            self.optimizer_map.step()
+            
+        print("Mapping matrix learning finished!")
         
-    def forward(self):
-        x = self.M
+        # take final softmax w/o computing gradients
+        with torch.no_grad():
+            self.model_map.eval()
+            emb_sp = emb_sp.cpu().numpy()
+            emb_sc = emb_sc.cpu().numpy()
+            map_matrix = F.softmax(self.map_matrix, dim=1).cpu().numpy() # dim=1: normalization by cell
+            
+            self.adata.obsm['emb_sp'] = emb_sp
+            self.adata_sc.obsm['emb_sc'] = emb_sc
+            self.adata.obsm['map_matrix'] = map_matrix.T # spot x cell
+
+            return self.adata, self.adata_sc
+    
+    def loss(self, emb_sp, emb_sc):
+        '''\
+        Calculate loss
+
+        Parameters
+        ----------
+        emb_sp : torch tensor
+            Spatial spot representation matrix.
+        emb_sc : torch tensor
+            scRNA cell representation matrix.
+
+        Returns
+        -------
+        Loss values.
+
+        '''
+        # cell-to-spot
+        map_probs = F.softmax(self.map_matrix, dim=1)   # dim=0: normalization by cell
+        self.pred_sp = torch.matmul(map_probs.t(), emb_sc)
+           
+        loss_recon = F.mse_loss(self.pred_sp, emb_sp, reduction='mean')
+        loss_NCE = self.Noise_Cross_Entropy(self.pred_sp, emb_sp)
+           
+        return loss_recon, loss_NCE
         
-        return x 
+    def Noise_Cross_Entropy(self, pred_sp, emb_sp):
+        '''\
+        Calculate noise cross entropy. Considering spatial neighbors as positive pairs for each spot
+            
+        Parameters
+        ----------
+        pred_sp : torch tensor
+            Predicted spatial gene expression matrix.
+        emb_sp : torch tensor
+            Reconstructed spatial gene expression matrix.
+
+        Returns
+        -------
+        loss : float
+            Loss value.
+
+        '''
+        
+        mat = self.cosine_similarity(pred_sp, emb_sp) 
+        k = torch.exp(mat).sum(axis=1) - torch.exp(torch.diag(mat, 0))
+        
+        # positive pairs
+        p = torch.exp(mat)
+        p = torch.mul(p, self.graph_neigh).sum(axis=1)
+        
+        ave = torch.div(p, k)
+        loss = - torch.log(ave).mean()
+        
+        return loss
+    
+    def cosine_similarity(self, pred_sp, emb_sp):  #pres_sp: spot x gene; emb_sp: spot x gene
+        '''\
+        Calculate cosine similarity based on predicted and reconstructed gene expression matrix.    
+        '''
+        
+        M = torch.matmul(pred_sp, emb_sp.T)
+        Norm_c = torch.norm(pred_sp, p=2, dim=1)
+        Norm_s = torch.norm(emb_sp, p=2, dim=1)
+        Norm = torch.matmul(Norm_c.reshape((pred_sp.shape[0], 1)), Norm_s.reshape((emb_sp.shape[0], 1)).T) + -5e-12
+        M = torch.div(M, Norm)
+        
+        if torch.any(torch.isnan(M)):
+           M = torch.where(torch.isnan(M), torch.full_like(M, 0.4868), M)
+
+        return M        
