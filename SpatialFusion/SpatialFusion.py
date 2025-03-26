@@ -3,7 +3,7 @@ from .preprocess import preprocess_adj, preprocess_adj_sparse, preprocess, const
 import time
 import random
 import numpy as np
-from .modelAT import Encoder, Encoder_sparse, Encoder_map, Encoder_sc
+from .model import Encoder, Encoder_sparse, Encoder_map, Encoder_sc
 from tqdm import tqdm
 from torch import nn
 import torch.nn.functional as F
