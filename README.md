@@ -20,3 +20,16 @@ You'll need to install the following packages in order to run the codes.
 * R==4.0.3
 
 
+## Installation
+### Using conda environment file
+```bash
+# Clone the repository
+git clone https://github.com/w2260584531/SpatialFusion-main.git
+cd SpatialFusion-main
+# Create environment from yml file
+conda env create -f environment.yml
+conda activate spatialfusion
+```
+
+## Tutorial
+For detailed tutorials and examples, please refer to: https://github.com/w2260584531/SpatialFusion-main/tree/main/tutorial
