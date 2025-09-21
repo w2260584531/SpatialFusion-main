@@ -1,4 +1,4 @@
-name: long
+name: SpatialFusion
 channels:
   - pytorch
   - conda-forge
